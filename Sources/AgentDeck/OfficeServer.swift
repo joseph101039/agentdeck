@@ -141,11 +141,16 @@ final class OfficeServer: ObservableObject {
         }
     }
 
-    /// The Retry button: a fresh start with the failure count cleared.
+    /// The Retry button: a fresh start with the failure count cleared,
+    /// once the old child is past its SIGKILL deadline.
     func restart() {
         stop()
         status = .starting
-        start()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.start() }
+        }
+        restartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.terminateGrace + 0.5, execute: work)
     }
 
     private func launch() {
@@ -194,6 +199,8 @@ final class OfficeServer: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         // the bundled copy must never try to update itself from upstream
         env["WMAD_NO_UPDATE_CHECK"] = "1"
+        // its parent-death watch compares against this, not a ppid read late
+        env["AGENTDECK_APP_PID"] = String(getpid())
         process.environment = env
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
@@ -339,8 +346,8 @@ final class OfficeServer: ObservableObject {
         failed(reason, generation: gen)
     }
 
-    /// One failed launch or crash: count it, then retry after 1s, 2s, 4s,
-    /// 8s, until five in a row have failed.
+    /// One failed launch or crash: count it, then retry after 2.5s, 2.5s,
+    /// 4s, 8s, until five in a row have failed.
     private func failed(_ reason: String, generation gen: Int) {
         guard gen == generation, !stopped else { return }
         startupTimer?.cancel()
@@ -361,7 +368,9 @@ final class OfficeServer: ObservableObject {
             return
         }
         status = .starting
-        let delay = pow(2, Double(consecutiveFailures - 1))
+        // never sooner than the old child's SIGKILL deadline: two servers
+        // must not run side by side
+        let delay = max(pow(2, Double(consecutiveFailures - 1)), Self.terminateGrace + 0.5)
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, !self.stopped else { return }
