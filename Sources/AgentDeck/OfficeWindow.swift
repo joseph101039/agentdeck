@@ -31,7 +31,7 @@ final class OfficeWindowController: NSWindowController, NSWindowDelegate, WKNavi
             backing: .buffered, defer: false
         )
         window.title = "Agent Office"
-        window.minSize = NSSize(width: 480, height: 320)
+        window.minSize = NSSize(width: 320, height: 200)
         window.isReleasedWhenClosed = false
         window.contentView = webView
         window.center()
