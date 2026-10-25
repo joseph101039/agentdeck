@@ -809,6 +809,8 @@ final class SessionsModel: ObservableObject {
                 text = String(decoding: data, as: UTF8.self)
                 if process.terminationStatus != 0 {
                     text = "install failed (exit \(process.terminationStatus)): \(text)"
+                } else if let trust = Self.trustCodexHooks() {
+                    text += "\n" + trust
                 }
             } catch {
                 text = "install failed: \(error.localizedDescription)"
@@ -820,6 +822,26 @@ final class SessionsModel: ObservableObject {
                 self?.reload()
             }
         }
+    }
+
+    /// Codex ignores a newly installed hook until it is trusted, so `codex
+    /// exec` and app-server runs would never report. The bundled script has
+    /// Codex's app-server trust AgentDeck's hooks. Returns its one-line
+    /// result for the footer, or nil when node or the script isn't there.
+    nonisolated static func trustCodexHooks() -> String? {
+        guard let script = Bundle.main.resourceURL?
+                  .appendingPathComponent("trust-codex-hooks.mjs"),
+              FileManager.default.fileExists(atPath: script.path),
+              let node = OfficeServer.resolveNode() else { return nil }
+        // the script gives up after 30s itself; this is the backstop
+        let result = BoundedSubprocess.run(node.path, arguments: [script.path], timeout: 40)
+        let output = String(decoding: result.output, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.timedOut { return "codex hooks: trust timed out" }
+        if result.status != 0 {
+            return "codex hooks: trust failed (exit \(result.status)): \(output)"
+        }
+        return output.isEmpty ? nil : output
     }
 
     // MARK: - Notifications
