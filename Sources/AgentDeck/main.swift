@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let model = SessionsModel()
     private let officeServer = OfficeServer()
     private lazy var officeWindow = OfficeWindowController(server: officeServer)
+    /// `killall AgentDeck` / logout send SIGTERM, which by default ends the
+    /// app without applicationWillTerminate — and so without stopping the
+    /// office server. Routed through terminate(_:) it gets the normal path.
+    private var sigtermSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -36,9 +40,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.start()
         refreshBadge()
         logStatusItemPlacement()
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler { NSApp.terminate(nil) }
+        source.resume()
+        sigtermSource = source
         officeServer.start()
         if UserDefaults.standard.bool(forKey: OfficeWindowController.openDefaultsKey) {
-            officeWindow.showOffice()
+            officeWindow.showOffice(activate: false)
         }
         // A brand-new install has no hooks and would otherwise look like an
         // app that simply does nothing — show it once, with instructions.
@@ -164,8 +173,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// The office server is our child; don't leave it running without us.
+    /// Waits (at most the grace period) because after this returns nothing
+    /// is left to send the SIGKILL.
     func applicationWillTerminate(_ notification: Notification) {
-        officeServer.stop()
+        officeServer.stop(wait: true)
     }
 
     func popoverDidClose(_ notification: Notification) {

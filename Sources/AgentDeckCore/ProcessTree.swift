@@ -172,13 +172,20 @@ public enum ProcessTree {
     /// `launchPath`; the arguments are searched in place and nothing is
     /// kept. Environment variables, which follow them, are not searched.
     public static func argumentsMention(_ needle: String, pid: pid_t) -> Bool {
+        argumentsMentionIfReadable(needle, pid: pid) ?? false
+    }
+
+    /// `argumentsMention`, but nil when the arguments can't be read (the
+    /// process is gone or not ours), for callers that must not treat
+    /// "unknown" as "no".
+    public static func argumentsMentionIfReadable(_ needle: String, pid: pid_t) -> Bool? {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
         guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size
-        else { return false }
+        else { return nil }
         var buffer = [UInt8](repeating: 0, count: size)
         guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0,
-              size > MemoryLayout<Int32>.size else { return false }
+              size > MemoryLayout<Int32>.size else { return nil }
         let argc = buffer.withUnsafeBytes { $0.load(as: Int32.self) }
         // layout: argc, exec path, NUL padding, then argc NUL-terminated args
         var i = MemoryLayout<Int32>.size

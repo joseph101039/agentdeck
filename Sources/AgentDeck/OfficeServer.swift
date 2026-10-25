@@ -24,6 +24,13 @@ final class OfficeServer: ObservableObject {
     /// and backoff start over if it dies later.
     private static let healthyUptime: TimeInterval = 30
     private static let startupTimeout: TimeInterval = 20
+    /// How long a child gets to exit on SIGTERM before SIGKILL. Killing our
+    /// own server is safe; a wedged one left behind would hold its port and
+    /// keep polling while its replacement starts.
+    private static let terminateGrace: TimeInterval = 2
+    /// A child can stay alive yet stop serving (a blocked event loop); the
+    /// window would then sit on a dead page. Two missed pings = failed.
+    private static let healthInterval: TimeInterval = 15
 
     private var process: Process?
     /// Bumped per launch; callbacks from an older child are ignored, so a
@@ -36,6 +43,9 @@ final class OfficeServer: ObservableObject {
     private var startupTimer: DispatchWorkItem?
     private var stdoutBuffer = ""
     private var stderrTail = ""
+    private var verifying = false
+    private var healthWork: DispatchWorkItem?
+    private var missedPings = 0
 
     // MARK: - Locating the pieces
 
@@ -99,14 +109,36 @@ final class OfficeServer: ObservableObject {
         launch()
     }
 
-    /// SIGTERM only; the server shuts down cleanly on it.
-    func stop() {
+    /// SIGTERM, then SIGKILL if it hasn't exited after `terminateGrace`.
+    /// `wait` blocks until it is gone (bounded by the grace period) — for
+    /// app termination, where nothing would be left to deliver the SIGKILL.
+    func stop(wait: Bool = false) {
         stopped = true
         generation += 1
         restartWork?.cancel()
         startupTimer?.cancel()
-        if let process, process.isRunning { process.terminate() }
+        healthWork?.cancel()
+        if let process { Self.terminate(process, wait: wait) }
         process = nil
+    }
+
+    private static func terminate(_ process: Process, wait: Bool) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        process.terminate()
+        let escalate = {
+            if process.isRunning {
+                SessionsModel.appLog("office: pid \(pid) ignored SIGTERM, sending SIGKILL")
+                kill(pid, SIGKILL)
+            }
+        }
+        if wait {
+            let deadline = Date().addingTimeInterval(terminateGrace)
+            while process.isRunning, Date() < deadline { usleep(50_000) }
+            escalate()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + terminateGrace, execute: escalate)
+        }
     }
 
     /// The Retry button: a fresh start with the failure count cleared.
@@ -122,6 +154,9 @@ final class OfficeServer: ObservableObject {
         status = .starting
         stdoutBuffer = ""
         stderrTail = ""
+        verifying = false
+        missedPings = 0
+        healthWork?.cancel()
         // Node lookup may run a login shell; keep it off the main thread.
         Task.detached {
             let node = OfficeServer.resolveNode()
@@ -182,7 +217,9 @@ final class OfficeServer: ObservableObject {
         }
         process.terminationHandler = { [weak self] p in
             let code = p.terminationStatus
-            DispatchQueue.main.async {
+            // a beat later, so the last stderr chunk (usually the reason it
+            // died) is queued ahead of us rather than after
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 MainActor.assumeIsolated { self?.childExited(code: code, generation: gen) }
             }
         }
@@ -212,7 +249,8 @@ final class OfficeServer: ObservableObject {
         while let newline = stdoutBuffer.firstIndex(of: "\n") {
             let line = String(stdoutBuffer[..<newline])
             stdoutBuffer.removeSubrange(...newline)
-            guard status == .starting, let port = Self.port(fromStartupLine: line) else { continue }
+            guard status == .starting, !verifying,
+                  let port = Self.port(fromStartupLine: line) else { continue }
             verify(port: port, instance: instance, generation: gen)
         }
         // a server that never prints a newline mustn't grow this forever
@@ -235,31 +273,63 @@ final class OfficeServer: ObservableObject {
 
     /// Port printed is not enough: confirm the server there is the one we
     /// launched (its instance id) and that our child is still alive.
+    /// The window loads the same 127.0.0.1 address that was verified:
+    /// `localhost` may resolve to ::1, where a different server can listen.
     private func verify(port: Int, instance: String, generation gen: Int) {
-        guard let pingURL = URL(string: "http://127.0.0.1:\(port)/api/ping") else { return }
+        verifying = true
         Task { [weak self] in
             var matched = false
             for attempt in 0..<5 {
                 if attempt > 0 { try? await Task.sleep(nanoseconds: 300_000_000) }
-                var request = URLRequest(url: pingURL)
-                request.timeoutInterval = 2
-                guard let (data, _) = try? await URLSession.shared.data(for: request),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
-                matched = object["instance"] as? String == instance
+                guard let answer = await Self.ping(port: port) else { continue }
+                matched = answer == instance
                 break
             }
             guard let self, gen == self.generation, !self.stopped else { return }
+            self.verifying = false
             guard matched, self.process?.isRunning == true else {
                 self.failed("the server on port \(port) isn't the one AgentDeck started",
                             generation: gen)
                 return
             }
             self.startupTimer?.cancel()
-            guard let url = URL(string: "http://localhost:\(port)") else { return }
+            guard let url = URL(string: "http://127.0.0.1:\(port)") else { return }
             SessionsModel.appLog("office: running at \(url.absoluteString)")
             self.status = .running(url)
+            self.scheduleHealthCheck(port: port, instance: instance, generation: gen)
         }
+    }
+
+    /// The instance id the server on `port` reports, or nil if it didn't answer.
+    nonisolated private static func ping(port: Int) async -> String? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/ping") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return object["instance"] as? String
+    }
+
+    private func scheduleHealthCheck(port: Int, instance: String, generation gen: Int) {
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                let answer = await Self.ping(port: port)
+                guard let self, gen == self.generation, !self.stopped else { return }
+                if answer == instance {
+                    self.missedPings = 0
+                } else {
+                    self.missedPings += 1
+                    if self.missedPings >= 2 {
+                        self.failed("the office server stopped answering", generation: gen)
+                        return
+                    }
+                }
+                self.scheduleHealthCheck(port: port, instance: instance, generation: gen)
+            }
+        }
+        healthWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.healthInterval, execute: work)
     }
 
     private func childExited(code: Int32, generation gen: Int) {
@@ -269,11 +339,13 @@ final class OfficeServer: ObservableObject {
         failed(reason, generation: gen)
     }
 
-    /// One failed launch or crash: count it, then retry after 1s, 2s, 4s …
-    /// capped at 60s, until five in a row have failed.
+    /// One failed launch or crash: count it, then retry after 1s, 2s, 4s,
+    /// 8s, until five in a row have failed.
     private func failed(_ reason: String, generation gen: Int) {
         guard gen == generation, !stopped else { return }
         startupTimer?.cancel()
+        healthWork?.cancel()
+        verifying = false
         if let launchedAt, Date().timeIntervalSince(launchedAt) >= Self.healthyUptime {
             consecutiveFailures = 0
         }
@@ -281,7 +353,7 @@ final class OfficeServer: ObservableObject {
         SessionsModel.appLog("office: failure \(consecutiveFailures): \(reason)")
         // invalidate this child's callbacks before signalling it
         generation += 1
-        if let process, process.isRunning { process.terminate() }
+        if let process { Self.terminate(process, wait: false) }
         process = nil
         launchedAt = nil
         guard consecutiveFailures < Self.maxConsecutiveFailures else {
@@ -289,7 +361,7 @@ final class OfficeServer: ObservableObject {
             return
         }
         status = .starting
-        let delay = min(60, pow(2, Double(consecutiveFailures - 1)))
+        let delay = pow(2, Double(consecutiveFailures - 1))
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, !self.stopped else { return }

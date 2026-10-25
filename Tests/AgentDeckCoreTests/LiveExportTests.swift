@@ -170,5 +170,7 @@ struct LiveExportTests {
         let leftovers = try FileManager.default
             .contentsOfDirectory(atPath: url.deletingLastPathComponent().path)
         #expect(leftovers == ["live.json"])
+        let mode = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int
+        #expect(mode == 0o600)
     }
 }

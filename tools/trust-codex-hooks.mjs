@@ -8,34 +8,56 @@
 // own app-server to do the same thing over JSON-RPC — Codex computes the
 // hashes and writes its config — instead of editing config.toml by hand.
 //
-//   node trust-codex-hooks.mjs [--list] [--needle <substr>]
+//   node trust-codex-hooks.mjs [--list] [--hook <path>]
 //
-//   --list            show matching hooks and their trust status; change nothing
-//   --needle <substr> only hooks whose definition contains this
-//                     (default: AgentDeck/bin/agentdeck-hook)
+//   --list         show AgentDeck's hooks and their trust status; change nothing
+//   --hook <path>  the installed helper (default: ~/Library/Application
+//                  Support/AgentDeck/bin/agentdeck-hook)
 //
-// Exits 1 on any RPC error, or if the app-server hasn't answered in 30s.
+// Only a user-level command hook whose command is exactly the one
+// HookInstaller writes (`'<helper>' codex`, or the older double-quoted
+// form) is trusted. Anything looser — a substring of the definition, a
+// project's .codex hooks — would let any repo get a hook approved just by
+// mentioning the path, which is what Codex's trust gate exists to stop.
+//
+// Exits 1 on any RPC error, when no AgentDeck hook is installed, or if the
+// app-server hasn't answered in 30s.
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
 import readline from 'node:readline';
 
 const TIMEOUT_MS = 30_000;
 
+const DEFAULT_HOOK = join(homedir(), 'Library/Application Support/AgentDeck/bin/agentdeck-hook');
+
 function parseArgs(argv) {
-  const o = { list: false, needle: 'AgentDeck/bin/agentdeck-hook' };
+  const o = { list: false, hook: DEFAULT_HOOK };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--list') o.list = true;
-    else if (a === '--needle' && i + 1 < argv.length) o.needle = argv[++i];
-    else if (a.startsWith('--needle=')) o.needle = a.slice('--needle='.length);
+    else if (a === '--hook' && i + 1 < argv.length) o.hook = argv[++i];
+    else if (a.startsWith('--hook=')) o.hook = a.slice('--hook='.length);
     else {
-      console.error(`unknown argument: ${a}\nusage: trust-codex-hooks.mjs [--list] [--needle <substr>]`);
+      console.error(`unknown argument: ${a}\nusage: trust-codex-hooks.mjs [--list] [--hook <path>]`);
       process.exit(2);
     }
   }
+  if (!isAbsolute(o.hook)) {
+    console.error('--hook must be an absolute path');
+    process.exit(2);
+  }
   return o;
+}
+
+// Same quoting as WorkspaceRestore.shellQuote / HookInstaller.command(for:).
+const shellQuote = (s) => `'${s.replaceAll("'", "'\\''")}'`;
+
+function isAgentDeckHook(h, hook) {
+  const accepted = [`${shellQuote(hook)} codex`];
+  if (!/[$`"\\!]/.test(hook)) accepted.push(`"${hook}" codex`);
+  return h.source === 'user' && h.handlerType === 'command' && accepted.includes(describe(h));
 }
 
 // Launched from a GUI app, PATH is the bare system one; Codex usually lives
@@ -58,7 +80,10 @@ const describe = (h) => h.command ?? h.handler?.command ?? h.hook?.command ?? ''
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const child = spawn(findCodex(), ['app-server'], { stdio: ['pipe', 'pipe', 'inherit'] });
+  // An npm-installed codex is a `#!/usr/bin/env node` script; from a GUI
+  // app's bare PATH that env lookup fails, so put our own node first.
+  const env = { ...process.env, PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter) };
+  const child = spawn(findCodex(), ['app-server'], { stdio: ['pipe', 'pipe', 'inherit'], env });
   const timer = setTimeout(() => {
     console.error(`codex app-server did not answer within ${TIMEOUT_MS / 1000}s`);
     child.kill();
@@ -72,6 +97,8 @@ async function main() {
   };
   child.on('error', (e) => failAll(new Error(`couldn't run codex: ${e.message}`)));
   child.on('exit', (code) => failAll(new Error(`codex app-server exited (${code})`)));
+  // a write after the child died raises EPIPE here; 'exit' reports it
+  child.stdin.on('error', () => {});
   readline.createInterface({ input: child.stdout }).on('line', (line) => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
@@ -93,19 +120,23 @@ async function main() {
       capabilities: null,
     });
     child.stdin.write(JSON.stringify({ method: 'initialized' }) + '\n');
-    const res = await call('hooks/list', { cwds: [process.cwd()] });
+    // Home, not the caller's cwd: a project's own .codex hooks are never ours.
+    const res = await call('hooks/list', { cwds: [homedir()] });
     const entries = (res.data || []).flatMap((d) => d.hooks || d.entries || [d]);
-    const matching = entries.filter((h) => JSON.stringify(h).includes(opts.needle));
+    const matching = entries.filter((h) => isAgentDeckHook(h, opts.hook));
     if (opts.list) {
-      if (!matching.length) console.log(`no hooks matching "${opts.needle}"`);
+      if (!matching.length) console.log(`no AgentDeck hooks for ${opts.hook}`);
       for (const h of matching) {
         console.log(`${(h.trustStatus || 'unknown').padEnd(10)} ${h.key}  ${describe(h)}`);
       }
       return;
     }
+    if (!matching.length) throw new Error(`no AgentDeck hooks installed in ~/.codex/hooks.json (looked for ${opts.hook})`);
     // `currentHash` is what Codex would store; without one there is
     // nothing to trust (a hook Codex couldn't resolve).
-    const targets = matching.filter((h) => h.trustStatus !== 'trusted' && h.currentHash);
+    const unhashed = matching.filter((h) => h.trustStatus !== 'trusted' && !h.currentHash);
+    if (unhashed.length) throw new Error(`Codex can't resolve ${unhashed.map((h) => h.key).join(', ')}`);
+    const targets = matching.filter((h) => h.trustStatus !== 'trusted');
     if (!targets.length) {
       console.log(`codex hooks: all ${matching.length} AgentDeck hooks already trusted`);
       return;

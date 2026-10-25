@@ -20,14 +20,19 @@ cp "$SRC/AgentDeck" "$SRC/agentdeck-hook" "$APP/Contents/MacOS/"
 # The office (whatsmyagentdoing) runs from a copy inside the bundle, so the
 # app never depends on a checkout staying where it was built from.
 OFFICE_SRC="${OFFICE_SRC:-$SCRIPT_DIR/../../whatsmyagentdoing}"
-if [ -f "$OFFICE_SRC/bin/cli.js" ]; then
+# OFFICE_SRC=none builds without it on purpose.
+if [ "$OFFICE_SRC" != none ]; then
+    if [ ! -f "$OFFICE_SRC/bin/cli.js" ]; then
+        echo "error: $OFFICE_SRC/bin/cli.js not found (set OFFICE_SRC, or OFFICE_SRC=none)" >&2
+        exit 1
+    fi
     mkdir -p "$APP/Contents/Resources/office"
-    for item in bin src public assets package.json scenes.json; do
-        [ -e "$OFFICE_SRC/$item" ] || continue
-        rsync -a --delete "$OFFICE_SRC/$item" "$APP/Contents/Resources/office/"
-    done
-else
-    echo "warning: $OFFICE_SRC not found; the Office window will report it missing" >&2
+    # One rsync of the whole tree with an allow-list, so anything a previous
+    # build copied that is no longer listed is removed too.
+    rsync -a --delete --delete-excluded \
+        --include='/bin/***' --include='/src/***' --include='/public/***' \
+        --include='/assets/***' --include='/package.json' --include='/scenes.json' \
+        --exclude='*' "$OFFICE_SRC/" "$APP/Contents/Resources/office/"
 fi
 TRUST_TOOL="$SCRIPT_DIR/../tools/trust-codex-hooks.mjs"
 [ -f "$TRUST_TOOL" ] && cp "$TRUST_TOOL" "$APP/Contents/Resources/"

@@ -238,12 +238,27 @@ public enum LiveExport {
     }
 
     /// Temp file + rename, so a reader polling the file never sees a
-    /// half-written document.
+    /// half-written document. Owner-only (0600): the feed lists project
+    /// paths and what each session is waiting on.
+    /// `Data.write(.atomic)` would recreate the file 0644 on every write.
     public static func write(_ feed: LiveFeed, to url: URL) throws {
         let data = try encode(feed)
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        let fm = FileManager.default
+        let dir = url.deletingLastPathComponent()
+        try fm.createDirectory(
+            at: dir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
-        try data.write(to: url, options: .atomic)
+        let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).\(getpid()).tmp")
+        try? fm.removeItem(at: tmp)
+        guard fm.createFile(atPath: tmp.path, contents: data,
+                            attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: tmp.path])
+        }
+        guard rename(tmp.path, url.path) == 0 else {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            try? fm.removeItem(at: tmp)
+            throw POSIXError(code)
+        }
     }
 }

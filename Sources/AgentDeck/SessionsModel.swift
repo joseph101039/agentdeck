@@ -827,12 +827,17 @@ final class SessionsModel: ObservableObject {
     /// Codex ignores a newly installed hook until it is trusted, so `codex
     /// exec` and app-server runs would never report. The bundled script has
     /// Codex's app-server trust AgentDeck's hooks. Returns its one-line
-    /// result for the footer, or nil when node or the script isn't there.
+    /// result for the footer — including when it couldn't run, since the
+    /// install otherwise looks complete while Codex stays silent.
     nonisolated static func trustCodexHooks() -> String? {
         guard let script = Bundle.main.resourceURL?
                   .appendingPathComponent("trust-codex-hooks.mjs"),
-              FileManager.default.fileExists(atPath: script.path),
-              let node = OfficeServer.resolveNode() else { return nil }
+              FileManager.default.fileExists(atPath: script.path) else {
+            return "codex hooks: NOT trusted — trust-codex-hooks.mjs isn't in this build"
+        }
+        guard let node = OfficeServer.resolveNode() else {
+            return "codex hooks: NOT trusted — Node.js not found (run `make install-hooks`)"
+        }
         // the script gives up after 30s itself; this is the backstop
         let result = BoundedSubprocess.run(node.path, arguments: [script.path], timeout: 40)
         let output = String(decoding: result.output, as: UTF8.self)
@@ -977,6 +982,7 @@ final class SessionsModel: ObservableObject {
     /// Live-feed caches keyed "key|pid": a process's parent session, start
     /// time and shared-ness can't change while that pid is the same process.
     private var liveParentCache: [String: String] = [:]
+    private var liveParentMiss: [String: Date] = [:]
     private var liveProcessCache: [String: (startedAt: Date, shared: Bool)] = [:]
     /// The last feed written, with `generatedAt` zeroed, so a reload that
     /// changed nothing doesn't rewrite the file.
@@ -1627,6 +1633,7 @@ extension SessionsModel {
         let registry = claudeRegistry
         var parents: [String: String] = [:]
         var processes: [String: (startedAt: Date, shared: Bool)] = [:]
+        var misses: [String: Date] = [:]
         let feed = LiveExport.makeFeed(
             rows: rows,
             waitingReasons: waitingReasons,
@@ -1641,16 +1648,22 @@ extension SessionsModel {
                     parents[cacheKey] = cached
                     return cached
                 }
-                // Only a found parent is cached: the parent's registry file
-                // can land after the child's first hook, and a cached miss
-                // would then hide the link for the child's whole life.
+                // A miss is cached only briefly: the parent's registry file
+                // can land after the child's first hook, so a permanent miss
+                // would hide the link for the child's whole life, while no
+                // cache at all repeats the ancestor walk on every reload.
+                if let missAt = self.liveParentMiss[cacheKey],
+                   Date().timeIntervalSince(missAt) < 10 {
+                    misses[cacheKey] = missAt
+                    return nil
+                }
                 let found = LiveExport.parentClaudeSession(
                     agentPid: pid,
                     parentPid: { ProcessTree.nameAndParent(of: $0)?.ppid },
                     isClaude: { ProcessTree.looksLikeAgent($0, provider: .claude) },
                     registry: registry
                 )
-                if let found { parents[cacheKey] = found }
+                if let found { parents[cacheKey] = found } else { misses[cacheKey] = Date() }
                 return found
             },
             process: { row in
@@ -1672,9 +1685,14 @@ extension SessionsModel {
                     processes[cacheKey] = cached
                     return .init(running: true, startedAt: cached.startedAt, shared: cached.shared)
                 }
-                let shared = row.provider == .codex
-                    && ProcessTree.argumentsMention("app-server", pid: pid)
-                guard let started = ProcessTree.startTime(of: pid) else {
+                // Unreadable arguments count as shared: closing is offered
+                // only on positive proof the process serves this session
+                // alone. Such a result isn't cached, so it's re-read.
+                let mention = row.provider == .codex
+                    ? ProcessTree.argumentsMentionIfReadable("app-server", pid: pid)
+                    : false
+                let shared = mention ?? true
+                guard mention != nil, let started = ProcessTree.startTime(of: pid) else {
                     return .init(running: true, startedAt: nil, shared: shared)
                 }
                 processes[cacheKey] = (started, shared)
@@ -1686,6 +1704,7 @@ extension SessionsModel {
         // Rebuilt from this pass only, so entries for ended sessions and
         // replaced pids don't accumulate.
         liveParentCache = parents
+        liveParentMiss = misses
         liveProcessCache = processes
         // agentPid follows the process the start time was read from, so a
         // consumer checking pid + start time compares like with like.

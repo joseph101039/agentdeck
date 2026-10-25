@@ -53,11 +53,17 @@ final class OfficeWindowController: NSWindowController, NSWindowDelegate, WKNavi
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func showOffice() {
+    /// `activate: false` when restoring at login: reopen the window
+    /// without stealing focus from whatever the user is doing.
+    func showOffice(activate: Bool = true) {
         UserDefaults.standard.set(true, forKey: Self.openDefaultsKey)
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if activate {
+            showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            window?.orderFront(nil)
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -85,12 +91,44 @@ final class OfficeWindowController: NSWindowController, NSWindowDelegate, WKNavi
     // A page that fails to load while the server is meant to be up (it
     // died between the ping and the request) is handled by the server's
     // restart; until then, say so instead of showing WebKit's blank page.
+    // A cancelled load is just another load replacing it, not a failure.
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
                  withError error: any Error) {
-        guard loadedBase != nil else { return }
+        loadFailed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: any Error) {
+        loadFailed(error)
+    }
+
+    private func loadFailed(_ error: any Error) {
+        guard loadedBase != nil, (error as NSError).code != NSURLErrorCancelled else { return }
         loadedBase = nil
         showStatusPage(title: "Couldn't reach the office", detail: error.localizedDescription,
                        retry: true)
+    }
+
+    /// WebKit's content process can be killed (memory pressure with a 3D
+    /// scene) and leaves a blank window; load the office again.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        let base = loadedBase
+        loadedBase = nil
+        render(base.map { .running($0) } ?? server.status)
+    }
+
+    /// The window shows our server and nothing else: the message handler is
+    /// attached to every page it loads. Links elsewhere open in the browser.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else { return decisionHandler(.cancel) }
+        let sameServer = loadedBase.map { url.host == $0.host && url.port == $0.port } ?? false
+        if sameServer || url.scheme == "about" {
+            return decisionHandler(.allow)
+        }
+        if url.scheme == "http" || url.scheme == "https", navigationAction.navigationType == .linkActivated {
+            NSWorkspace.shared.open(url)
+        }
+        decisionHandler(.cancel)
     }
 
     private func showStatusPage(title: String, detail: String?, retry: Bool) {
@@ -117,6 +155,8 @@ final class OfficeWindowController: NSWindowController, NSWindowDelegate, WKNavi
         text.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 }
 
