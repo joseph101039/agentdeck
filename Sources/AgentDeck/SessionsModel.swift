@@ -320,6 +320,12 @@ final class SessionsModel: ObservableObject {
 
     func reload(sweep: Bool = false) {
         var all = store.loadAll()
+        // The office reads names from the feed, and it has no popover open
+        // to trigger the refresh that `popoverOpened` does.
+        if sweep, !readOnly {
+            let names = CodexSessionIndex.load()
+            if names != codexNames { codexNames = names }
+        }
 
         // Read the registry BEFORE deciding what to delete. Expiring a
         // snapshot whose session is demonstrably still running no longer
@@ -391,6 +397,7 @@ final class SessionsModel: ObservableObject {
         sessions = output.rows
         frozenOrder = popoverVisible ? output.frozenOrder : nil
         waitingReasons = output.waitingReasons
+        if !readOnly { exportLive(rows: output.rows, heartbeat: sweep) }
         alertCount = output.alertCount
         doneCount = output.doneCount
         mostUrgent = output.mostUrgent
@@ -945,6 +952,13 @@ final class SessionsModel: ObservableObject {
     /// The openGeneration in which a transient footer message became visible,
     /// so it clears one open later rather than before it's ever shown.
     private var messageShownAtGen: Int?
+    /// Live-feed caches keyed "key|pid": a process's parent session, start
+    /// time and shared-ness can't change while that pid is the same process.
+    private var liveParentCache: [String: String] = [:]
+    private var liveProcessCache: [String: (startedAt: Date, shared: Bool)] = [:]
+    /// The last feed written, with `generatedAt` zeroed, so a reload that
+    /// changed nothing doesn't rewrite the file.
+    private var lastLiveFeed: LiveFeed?
 
     private func noteMessageChanged() {
         messageShownAtGen = popoverVisible ? openGeneration : nil
@@ -1574,6 +1588,99 @@ extension SessionsModel {
                 self.installMessage = "Couldn't delete: \(error.localizedDescription)"
             }
             self.refreshWorkspaces()
+        }
+    }
+}
+
+// MARK: - Live feed
+
+extension SessionsModel {
+    /// Publishes the merged rows to `LiveExport.defaultURL` for the office
+    /// view. A sweep always writes, even unchanged, so `generatedAt` works
+    /// as a heartbeat; other reloads write only when something changed. A
+    /// failed write is logged and otherwise ignored — the popover must not
+    /// depend on a viewer.
+    func exportLive(rows: [SessionSnapshot], heartbeat: Bool) {
+        let live = claudeLiveSessions
+        let registry = claudeRegistry
+        var parents: [String: String] = [:]
+        var processes: [String: (startedAt: Date, shared: Bool)] = [:]
+        let feed = LiveExport.makeFeed(
+            rows: rows,
+            waitingReasons: waitingReasons,
+            claudeLive: live,
+            codexNames: codexNames,
+            claudeModels: claudeModels,
+            claudeSessionKinds: claudeSessionKinds,
+            parentOf: { row in
+                guard let pid = row.agentPid else { return nil }
+                let cacheKey = "\(row.key)|\(pid)"
+                if let cached = self.liveParentCache[cacheKey] {
+                    parents[cacheKey] = cached
+                    return cached
+                }
+                // Only a found parent is cached: the parent's registry file
+                // can land after the child's first hook, and a cached miss
+                // would then hide the link for the child's whole life.
+                let found = LiveExport.parentClaudeSession(
+                    agentPid: pid,
+                    parentPid: { ProcessTree.nameAndParent(of: $0)?.ppid },
+                    isClaude: { ProcessTree.looksLikeAgent($0, provider: .claude) },
+                    registry: registry
+                )
+                if let found { parents[cacheKey] = found }
+                return found
+            },
+            process: { row in
+                // Claude's registry names the session's current process,
+                // which a discovered or long-quiet row may not carry.
+                let pid = row.provider == .claude
+                    ? live[row.sessionId]?.pid ?? row.agentPid
+                    : row.agentPid
+                let running = (row.provider == .claude && live[row.sessionId] != nil)
+                    || row.agentPid.map {
+                        Liveness.pidIsTrustworthy($0, forUpdatedAt: row.updatedAt,
+                                                  provider: row.provider)
+                    } == true
+                guard running, let pid else {
+                    return .init(running: running, startedAt: nil, shared: false)
+                }
+                let cacheKey = "\(row.key)|\(pid)"
+                if let cached = self.liveProcessCache[cacheKey] {
+                    processes[cacheKey] = cached
+                    return .init(running: true, startedAt: cached.startedAt, shared: cached.shared)
+                }
+                let shared = row.provider == .codex
+                    && ProcessTree.argumentsMention("app-server", pid: pid)
+                guard let started = ProcessTree.startTime(of: pid) else {
+                    return .init(running: true, startedAt: nil, shared: shared)
+                }
+                processes[cacheKey] = (started, shared)
+                return .init(running: true, startedAt: started, shared: shared)
+            },
+            appPid: getpid(),
+            now: Date()
+        )
+        // Rebuilt from this pass only, so entries for ended sessions and
+        // replaced pids don't accumulate.
+        liveParentCache = parents
+        liveProcessCache = processes
+        // agentPid follows the process the start time was read from, so a
+        // consumer checking pid + start time compares like with like.
+        var exported = feed
+        for i in exported.sessions.indices where exported.sessions[i].provider == .claude {
+            if let pid = live[exported.sessions[i].sessionId]?.pid {
+                exported.sessions[i].agentPid = pid
+            }
+        }
+        var comparable = exported
+        comparable.generatedAt = .distantPast
+        guard heartbeat || comparable != lastLiveFeed else { return }
+        do {
+            try LiveExport.write(exported, to: LiveExport.defaultURL)
+            lastLiveFeed = comparable
+        } catch {
+            Self.appLog("live export: write FAILED: \(error)")
         }
     }
 }

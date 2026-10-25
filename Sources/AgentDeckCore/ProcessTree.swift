@@ -171,7 +171,7 @@ public enum ProcessTree {
     /// (case-insensitive). Reads the same `KERN_PROCARGS2` block as
     /// `launchPath`; the arguments are searched in place and nothing is
     /// kept. Environment variables, which follow them, are not searched.
-    static func argumentsMention(_ needle: String, pid: pid_t) -> Bool {
+    public static func argumentsMention(_ needle: String, pid: pid_t) -> Bool {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
         guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size
