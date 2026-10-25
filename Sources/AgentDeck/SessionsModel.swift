@@ -322,9 +322,15 @@ final class SessionsModel: ObservableObject {
         var all = store.loadAll()
         // The office reads names from the feed, and it has no popover open
         // to trigger the refresh that `popoverOpened` does.
+        // The index only grows; re-read it when it was written, not every sweep.
         if sweep, !readOnly {
-            let names = CodexSessionIndex.load()
-            if names != codexNames { codexNames = names }
+            let mtime = (try? FileManager.default.attributesOfItem(
+                atPath: CodexSessionIndex.defaultURL.path))?[.modificationDate] as? Date
+            if mtime != codexIndexMtime {
+                codexIndexMtime = mtime
+                let names = CodexSessionIndex.load()
+                if names != codexNames { codexNames = names }
+            }
         }
 
         // Read the registry BEFORE deciding what to delete. Expiring a
@@ -983,6 +989,7 @@ final class SessionsModel: ObservableObject {
     /// time and shared-ness can't change while that pid is the same process.
     private var liveParentCache: [String: String] = [:]
     private var liveParentMiss: [String: Date] = [:]
+    private var codexIndexMtime: Date?
     private var liveProcessCache: [String: (startedAt: Date, shared: Bool)] = [:]
     /// The last feed written, with `generatedAt` zeroed, so a reload that
     /// changed nothing doesn't rewrite the file.
