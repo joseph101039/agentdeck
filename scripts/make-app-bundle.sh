@@ -16,6 +16,21 @@ VERSION="${VERSION:-0.0.0}"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$SRC/AppIcon.icns" "$APP/Contents/Resources/"
 cp "$SRC/AgentDeck" "$SRC/agentdeck-hook" "$APP/Contents/MacOS/"
+
+# The office (whatsmyagentdoing) runs from a copy inside the bundle, so the
+# app never depends on a checkout staying where it was built from.
+OFFICE_SRC="${OFFICE_SRC:-$SCRIPT_DIR/../../whatsmyagentdoing}"
+if [ -f "$OFFICE_SRC/bin/cli.js" ]; then
+    mkdir -p "$APP/Contents/Resources/office"
+    for item in bin src public assets package.json scenes.json; do
+        [ -e "$OFFICE_SRC/$item" ] || continue
+        rsync -a --delete "$OFFICE_SRC/$item" "$APP/Contents/Resources/office/"
+    done
+else
+    echo "warning: $OFFICE_SRC not found; the Office window will report it missing" >&2
+fi
+TRUST_TOOL="$SCRIPT_DIR/../tools/trust-codex-hooks.mjs"
+[ -f "$TRUST_TOOL" ] && cp "$TRUST_TOOL" "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,6 +45,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleVersion</key><string>${VERSION}</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSAppTransportSecurity</key>
+    <dict><key>NSAllowsLocalNetworking</key><true/></dict>
     <key>NSAppleEventsUsageDescription</key>
     <string>AgentDeck focuses the iTerm2 tab for the session you click, and reads tab titles to label rows.</string>
 </dict>

@@ -6,6 +6,8 @@ struct SessionListView: View {
     /// ImageRenderer can't lay out ScrollView/LazyVStack, so the offscreen
     /// render harness swaps in a plain stack to inspect the real rows.
     var staticLayout = false
+    /// Opens the office window; nil (the render harness) hides the button.
+    var openOffice: (() -> Void)? = nil
     /// -1 until a key is pressed: a highlight on row 0 that nobody asked for
     /// reads as "this row is special" rather than "keyboard cursor".
     @State private var selection: Int = -1
@@ -254,6 +256,12 @@ struct SessionListView: View {
                 healthDot(model.claudeStatus, label: "claude")
                 healthDot(model.codexStatus, label: "codex")
                 Spacer()
+                if let openOffice {
+                    Button("Office") { openOffice() }
+                        .font(.caption)
+                        .keyboardShortcut("o", modifiers: .command)
+                        .help("Open the 3D office view (⌘O)")
+                }
                 if model.hooksNeedInstalling {
                     Button(model.isInstalling ? "Installing…" : "Install hooks") {
                         model.installHooks()

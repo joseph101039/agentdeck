@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let model = SessionsModel()
+    private let officeServer = OfficeServer()
+    private lazy var officeWindow = OfficeWindowController(server: officeServer)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -22,7 +24,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.action = #selector(togglePopover)
         }
         popover.contentViewController = NSHostingController(
-            rootView: SessionListView(model: model)
+            rootView: SessionListView(model: model, openOffice: { [weak self] in
+                self?.popover.performClose(nil)
+                self?.officeWindow.showOffice()
+            })
         )
         popover.behavior = .transient
         popover.delegate = self
@@ -31,6 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         model.start()
         refreshBadge()
         logStatusItemPlacement()
+        officeServer.start()
+        if UserDefaults.standard.bool(forKey: OfficeWindowController.openDefaultsKey) {
+            officeWindow.showOffice()
+        }
         // A brand-new install has no hooks and would otherwise look like an
         // app that simply does nothing — show it once, with instructions.
         if model.hooksNeedInstalling, model.claudeStatus != .blockedByPolicy {
@@ -152,6 +161,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    /// The office server is our child; don't leave it running without us.
+    func applicationWillTerminate(_ notification: Notification) {
+        officeServer.stop()
     }
 
     func popoverDidClose(_ notification: Notification) {
