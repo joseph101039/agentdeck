@@ -2,6 +2,8 @@ import Foundation
 
 public enum HookAction: Equatable, Sendable {
     case set(SessionState)
+    /// Refresh the row's metadata but keep its state (ready when there is no row yet).
+    case keep
     case remove
     case ignore
 }
@@ -33,6 +35,11 @@ public enum EventMapping {
     /// resume hands the session to another client.
     static let survivingEndReasons: Set<String> = ["clear", "resume"]
 
+    /// SessionStart sources that continue the same conversation: compaction
+    /// fires mid-turn when automatic, or at the prompt after /compact, and
+    /// no hook follows until the turn's Stop.
+    static let continuingStartSources: Set<String> = ["compact"]
+
     /// Whether a notification type means the session is blocked on a human.
     /// Also used to re-judge snapshots written by older builds, which
     /// recorded idle nudges as blocking waits.
@@ -45,10 +52,14 @@ public enum EventMapping {
         provider: Provider,
         event: String,
         notificationType: String? = nil,
-        endReason: String? = nil
+        endReason: String? = nil,
+        startSource: String? = nil
     ) -> HookAction {
         switch event {
         case "SessionStart":
+            if let startSource, continuingStartSources.contains(startSource.lowercased()) {
+                return .keep
+            }
             return .set(.ready)
         case "UserPromptSubmit":
             return .set(.working)

@@ -215,6 +215,58 @@ final class HookProcessorTests {
         #expect(store.load(key: "claude-keep") == nil)
     }
 
+    @Test func compactionMidTurnKeepsWorkingAndAtPromptKeepsDone() {
+        // auto-compaction fires SessionStart(source: compact) while the turn
+        // goes on; no hook follows until Stop, so resetting to ready would
+        // show a working session as idle for the rest of the turn
+        for (before, event) in [(SessionState.working, "UserPromptSubmit"), (.done, "Stop")] {
+            let id = "compact-\(before)"
+            _ = process(.claude, ["hook_event_name": "UserPromptSubmit", "session_id": id, "cwd": "/p"])
+            if event == "Stop" { _ = process(.claude, ["hook_event_name": "Stop", "session_id": id]) }
+            let action = process(.claude, [
+                "hook_event_name": "SessionStart", "session_id": id, "source": "compact", "model": "claude-opus-5-5",
+            ])
+            #expect(action == .keep)
+            let prior = store.load(key: "claude-\(id)")
+            Thread.sleep(forTimeInterval: 0.01)
+            let action2 = process(.claude, [
+                "hook_event_name": "SessionStart", "session_id": id, "source": "compact", "model": "claude-opus-5-5",
+            ])
+            #expect(action2 == .keep)
+            let snap = store.load(key: "claude-\(id)")
+            #expect(snap?.state == before)
+            // an acknowledged row must not look new again
+            #expect(snap?.updatedAt == prior?.updatedAt)
+            #expect(snap?.event == prior?.event)
+            #expect(snap?.projectPath == "/p")
+            #expect(snap?.model == "claude-opus-5-5")
+        }
+    }
+
+    @Test func compactionKeepsAnErrorAndItsKind() {
+        _ = process(.claude, ["hook_event_name": "UserPromptSubmit", "session_id": "err", "cwd": "/p"])
+        _ = process(.claude, ["hook_event_name": "StopFailure", "session_id": "err", "error": "rate_limit"])
+        _ = process(.claude, ["hook_event_name": "SessionStart", "session_id": "err", "source": "compact"])
+        #expect(store.load(key: "claude-err")?.state == .error)
+        #expect(store.load(key: "claude-err")?.errorKind == "rate_limit")
+    }
+
+    @Test func compactionKeepsAWaitAndItsReason() {
+        _ = process(.claude, ["hook_event_name": "UserPromptSubmit", "session_id": "w", "cwd": "/p"])
+        _ = process(.claude, ["hook_event_name": "Notification", "session_id": "w", "notification_type": "permission_prompt"])
+        _ = process(.claude, ["hook_event_name": "SessionStart", "session_id": "w", "source": "compact", "notification_type": "idle_prompt"])
+        #expect(store.load(key: "claude-w")?.state == .waiting)
+        #expect(store.load(key: "claude-w")?.notificationType == "permission_prompt")
+    }
+
+    @Test func compactionOfAnUnknownSessionStartsItReady() {
+        let action = process(.claude, [
+            "hook_event_name": "SessionStart", "session_id": "late", "source": "compact", "cwd": "/p",
+        ])
+        #expect(action == .keep)
+        #expect(store.load(key: "claude-late")?.state == .ready)
+    }
+
     @Test func codexLifecycleFixture() {
         // shape recorded from codex-cli 0.145.0 (session_id, turn_id, model…)
         let base: [String: Any] = [

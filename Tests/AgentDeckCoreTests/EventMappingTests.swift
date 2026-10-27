@@ -11,6 +11,16 @@ struct EventMappingTests {
         #expect(EventMapping.action(provider: .claude, event: "SessionEnd") == .remove)
     }
 
+    @Test func compactionKeepsTheStateOtherStartsReset() {
+        // a compaction fires SessionStart mid-turn (auto) or at the prompt
+        // (/compact); neither starts a new conversation
+        #expect(EventMapping.action(provider: .claude, event: "SessionStart", startSource: "compact") == .keep)
+        #expect(EventMapping.action(provider: .claude, event: "SessionStart", startSource: "COMPACT") == .keep)
+        for source in ["startup", "resume", "clear"] {
+            #expect(EventMapping.action(provider: .claude, event: "SessionStart", startSource: source) == .set(.ready))
+        }
+    }
+
     @Test(arguments: [
         "permission_prompt", "elicitation_dialog",
         "agent_needs_input", "Permission_Prompt",

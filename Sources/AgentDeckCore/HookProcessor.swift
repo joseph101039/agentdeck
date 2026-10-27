@@ -52,7 +52,8 @@ public enum HookProcessor {
             provider: provider,
             event: event,
             notificationType: meta.notificationType,
-            endReason: payload["reason"] as? String
+            endReason: payload["reason"] as? String,
+            startSource: payload["source"] as? String
         )
         let key = "\(provider.rawValue)-\(sessionId)"
 
@@ -67,8 +68,13 @@ public enum HookProcessor {
                 break
             case .remove:
                 store.remove(key: key)
-            case .set(let state):
+            case .set, .keep:
                 let existing = store.load(key: key)
+                // .keep refreshes metadata only: the state, its event and its
+                // time stay, so an acknowledged done/wait doesn't re-alert
+                let kept = action == .keep ? existing : nil
+                let state: SessionState
+                if case .set(let s) = action { state = s } else { state = existing?.state ?? .ready }
                 // Stop only ever updates: creating on Stop would resurrect a
                 // session that a concurrent SessionEnd hook just removed
                 if event == "Stop" && existing == nil { return .ignore }
@@ -84,13 +90,13 @@ public enum HookProcessor {
                     sessionId: sessionId,
                     projectPath: cwd,
                     state: state,
-                    event: event,
-                    updatedAt: now,
+                    event: kept?.event ?? event,
+                    updatedAt: kept?.updatedAt ?? now,
                     terminalSessionId: terminal,
                     agentPid: pid,
                     // only meaningful while waiting; stale reasons would mislead
                     notificationType: state == .waiting
-                        ? (meta.notificationType ?? existing?.notificationType) : nil,
+                        ? (kept != nil ? kept?.notificationType : meta.notificationType ?? existing?.notificationType) : nil,
                     permissionMode: meta.permissionMode ?? existing?.permissionMode,
                     model: meta.model ?? existing?.model,
                     // only a payload that actually carried a model refreshes
@@ -98,7 +104,7 @@ public enum HookProcessor {
                     // look newly observed
                     modelObservedAt: meta.model != nil ? now : existing?.modelObservedAt,
                     effort: meta.effort ?? existing?.effort,
-                    errorKind: state == .error ? meta.errorKind : nil
+                    errorKind: state == .error ? (kept != nil ? kept?.errorKind : meta.errorKind) : nil
                 )
                 try? store.write(snapshot)
             }
