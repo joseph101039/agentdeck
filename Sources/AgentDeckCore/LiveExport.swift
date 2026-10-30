@@ -32,13 +32,18 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// `agentPid` is a Codex app-server shared by many threads: it never
     /// sends SessionEnd and must never be signalled on one thread's behalf.
     public var sharedProcess: Bool
+    /// Codex only: `agentPid` is the managed app-server daemon that newer
+    /// Codex CLIs talk to, and a terminal `codex` client is still open in
+    /// the session's project. The daemon outlives every client, so this —
+    /// not `running` — is what says the user still has the session open.
+    public var clientAttached: Bool
 
     public init(
         key: String, provider: Provider, sessionId: String, state: SessionState,
         event: String, updatedAt: Date, projectPath: String, agentPid: Int32?,
         name: String?, model: String?, waitingReason: String?, discovered: Bool,
         background: Bool, parentSessionId: String?, running: Bool,
-        processStartedAt: Date?, sharedProcess: Bool
+        processStartedAt: Date?, sharedProcess: Bool, clientAttached: Bool = false
     ) {
         self.key = key
         self.provider = provider
@@ -57,12 +62,13 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.running = running
         self.processStartedAt = processStartedAt
         self.sharedProcess = sharedProcess
+        self.clientAttached = clientAttached
     }
 
     private enum CodingKeys: String, CodingKey {
         case key, provider, sessionId, state, event, updatedAt, projectPath
         case agentPid, name, model, waitingReason, discovered, background
-        case parentSessionId, running, processStartedAt, sharedProcess
+        case parentSessionId, running, processStartedAt, sharedProcess, clientAttached
     }
 
     // Written by hand so absent values are emitted as explicit nulls. The
@@ -88,6 +94,7 @@ public struct LiveSession: Codable, Equatable, Sendable {
         try c.encode(running, forKey: .running)
         try c.encode(processStartedAt, forKey: .processStartedAt)
         try c.encode(sharedProcess, forKey: .sharedProcess)
+        try c.encode(clientAttached, forKey: .clientAttached)
     }
 }
 
@@ -129,11 +136,27 @@ public enum LiveExport {
         public var running: Bool
         public var startedAt: Date?
         public var shared: Bool
+        public var clientAttached: Bool
 
-        public init(running: Bool, startedAt: Date?, shared: Bool) {
+        public init(running: Bool, startedAt: Date?, shared: Bool, clientAttached: Bool = false) {
             self.running = running
             self.startedAt = startedAt
             self.shared = shared
+            self.clientAttached = clientAttached
+        }
+    }
+
+    /// Whether a terminal Codex client is open in `projectPath`. A client
+    /// talking to the managed daemon names no thread in its arguments, so
+    /// the project directory is the only link; two clients in one project
+    /// keep each other's sessions shown, which beats hiding an open one.
+    public static func codexClientAttached(
+        projectPath: String, clientDirectories: Set<String>
+    ) -> Bool {
+        guard !projectPath.isEmpty else { return false }
+        let wanted = URL(fileURLWithPath: projectPath).standardizedFileURL.path
+        return clientDirectories.contains {
+            URL(fileURLWithPath: $0).standardizedFileURL.path == wanted
         }
     }
 
@@ -179,7 +202,8 @@ public enum LiveExport {
                 parentSessionId: row.provider == .codex ? parentOf(row) : nil,
                 running: facts.running,
                 processStartedAt: facts.startedAt,
-                sharedProcess: facts.shared
+                sharedProcess: facts.shared,
+                clientAttached: facts.clientAttached
             )
         }
         return LiveFeed(generatedAt: now, appPid: appPid, sessions: sessions)

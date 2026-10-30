@@ -217,6 +217,32 @@ public enum ProcessTree {
         return Array(pids.prefix(Int(filled))).filter { $0 > 0 }
     }
 
+    /// Working directory of `pid`, or nil when it can't be read.
+    public static func currentDirectory(of pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { raw in
+            String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+        return path.isEmpty ? nil : path
+    }
+
+    /// Working directories of the Codex clients open in a terminal. Newer
+    /// Codex CLIs run each thread inside a shared app-server daemon, so the
+    /// hook's ancestor is the daemon and the client the user actually has
+    /// open shows up only here. A daemon has no terminal and is skipped.
+    public static func codexTerminalClientDirectories() -> Set<String> {
+        var dirs = Set<String>()
+        for pid in allPids() where looksLikeAgent(pid, provider: .codex) {
+            guard controllingTTY(of: pid) != nil,
+                  argumentsMentionIfReadable("app-server", pid: pid) == false,
+                  let dir = currentDirectory(of: pid) else { continue }
+            dirs.insert(dir)
+        }
+        return dirs
+    }
+
     /// Which of `threadIds` a running Codex process was started with —
     /// `codex resume <id>` carries the id in its arguments. Codex has no
     /// session registry and runs no hook until the first message after a

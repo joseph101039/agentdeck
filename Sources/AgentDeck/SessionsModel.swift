@@ -990,7 +990,7 @@ final class SessionsModel: ObservableObject {
     private var liveParentCache: [String: String] = [:]
     private var liveParentMiss: [String: Date] = [:]
     private var codexIndexMtime: Date?
-    private var liveProcessCache: [String: (startedAt: Date, shared: Bool)] = [:]
+    private var liveProcessCache: [String: (startedAt: Date, shared: Bool, daemon: Bool)] = [:]
     /// The last feed written, with `generatedAt` zeroed, so a reload that
     /// changed nothing doesn't rewrite the file.
     private var lastLiveFeed: LiveFeed?
@@ -1639,7 +1639,15 @@ extension SessionsModel {
         let live = claudeLiveSessions
         let registry = claudeRegistry
         var parents: [String: String] = [:]
-        var processes: [String: (startedAt: Date, shared: Bool)] = [:]
+        var processes: [String: (startedAt: Date, shared: Bool, daemon: Bool)] = [:]
+        // Scanned at most once per export, and only if a daemon row asks.
+        var clientDirs: Set<String>?
+        func attached(_ row: SessionSnapshot, daemon: Bool) -> Bool {
+            guard daemon else { return false }
+            if clientDirs == nil { clientDirs = ProcessTree.codexTerminalClientDirectories() }
+            return LiveExport.codexClientAttached(
+                projectPath: row.projectPath, clientDirectories: clientDirs ?? [])
+        }
         var misses: [String: Date] = [:]
         let feed = LiveExport.makeFeed(
             rows: rows,
@@ -1690,7 +1698,8 @@ extension SessionsModel {
                 let cacheKey = "\(row.key)|\(pid)"
                 if let cached = self.liveProcessCache[cacheKey] {
                     processes[cacheKey] = cached
-                    return .init(running: true, startedAt: cached.startedAt, shared: cached.shared)
+                    return .init(running: true, startedAt: cached.startedAt, shared: cached.shared,
+                                 clientAttached: attached(row, daemon: cached.daemon))
                 }
                 // Unreadable arguments count as shared: closing is offered
                 // only on positive proof the process serves this session
@@ -1699,11 +1708,17 @@ extension SessionsModel {
                     ? ProcessTree.argumentsMentionIfReadable("app-server", pid: pid)
                     : false
                 let shared = mention ?? true
+                // The managed daemon newer Codex CLIs talk to, as opposed to
+                // a plugin's app-server, which never ends its threads.
+                let daemon = mention == true
+                    && ProcessTree.argumentsMention("--managed-daemon", pid: pid)
                 guard mention != nil, let started = ProcessTree.startTime(of: pid) else {
-                    return .init(running: true, startedAt: nil, shared: shared)
+                    return .init(running: true, startedAt: nil, shared: shared,
+                                 clientAttached: attached(row, daemon: daemon))
                 }
-                processes[cacheKey] = (started, shared)
-                return .init(running: true, startedAt: started, shared: shared)
+                processes[cacheKey] = (started, shared, daemon)
+                return .init(running: true, startedAt: started, shared: shared,
+                             clientAttached: attached(row, daemon: daemon))
             },
             appPid: getpid(),
             now: Date()

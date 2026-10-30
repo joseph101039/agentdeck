@@ -152,6 +152,38 @@ struct LiveExportTests {
         #expect(claude.agentPid == 10 && codex.agentPid == 11)
     }
 
+    @Test func clientAttachedCopiedAndEncoded() throws {
+        let result = feed(
+            [snapshot(.codex, "x1", pid: 11), snapshot(.codex, "x2", pid: 11)],
+            process: { row in
+                .init(running: true, startedAt: nil, shared: true,
+                      clientAttached: row.sessionId == "x1")
+            }
+        )
+        #expect(result.sessions.map(\.clientAttached) == [true, false])
+        let json = String(decoding: try LiveExport.encode(result), as: UTF8.self)
+        #expect(json.contains("\"clientAttached\":true"))
+        #expect(json.contains("\"clientAttached\":false"))
+    }
+
+    @Test func codexClientAttachedMatchesProjectDirectory() {
+        let dirs: Set<String> = ["/Users/j/projects/okcloud", "/tmp/other"]
+        #expect(LiveExport.codexClientAttached(
+            projectPath: "/Users/j/projects/okcloud", clientDirectories: dirs))
+        // trailing slash and dot segments name the same directory
+        #expect(LiveExport.codexClientAttached(
+            projectPath: "/Users/j/projects/./okcloud/", clientDirectories: dirs))
+        // a parent or child directory is a different project
+        #expect(!LiveExport.codexClientAttached(
+            projectPath: "/Users/j/projects", clientDirectories: dirs))
+        #expect(!LiveExport.codexClientAttached(
+            projectPath: "/Users/j/projects/okcloud/sub", clientDirectories: dirs))
+        // no project, or no client at all, is never attached
+        #expect(!LiveExport.codexClientAttached(projectPath: "", clientDirectories: dirs))
+        #expect(!LiveExport.codexClientAttached(
+            projectPath: "/Users/j/projects/okcloud", clientDirectories: []))
+    }
+
     @Test func writeIsAtomicAndReadable() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("live-export-\(UUID().uuidString)")
